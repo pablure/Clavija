@@ -1,5 +1,6 @@
-// Caché sencilla para que Clavija funcione sin conexión una vez abierta.
-const CACHE = 'clavija-v1';
+// Caché para que Clavija funcione sin conexión.
+// Primero intenta la red (así siempre recibes la última versión) y si no hay conexión usa la copia guardada.
+const CACHE = 'clavija-v2';
 const FILES = ['./', './index.html', './manifest.json', './icon.svg'];
 
 self.addEventListener('install', e => {
@@ -15,10 +16,10 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
   e.respondWith(
-    caches.match(e.request).then(hit => hit || fetch(e.request).then(res => {
+    fetch(e.request).then(res => {
       const copy = res.clone();
       caches.open(CACHE).then(c => c.put(e.request, copy));
       return res;
-    }).catch(() => hit))
+    }).catch(() => caches.match(e.request))
   );
 });

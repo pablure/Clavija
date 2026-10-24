@@ -73,6 +73,9 @@ select{
 .readout b{color:var(--bone);font-weight:600}
 .hint{min-height:1.4em;font-weight:700;font-size:16px;text-align:center}
 .hint.flat,.hint.sharp{color:var(--off)} .hint.good{color:var(--ok)} .hint.wait{color:var(--dust);font-weight:600}
+.meter{display:flex;align-items:center;gap:10px;width:100%;max-width:260px;margin-top:6px;font:400 11px var(--f-mono);color:var(--dust)}
+.meter-bar{flex:1;height:5px;border-radius:3px;background:var(--rosewood);overflow:hidden}
+.meter-fill{height:100%;background:var(--brass);transform:scaleX(0);transform-origin:left}
 .strings{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
 .str{
   background:var(--rosewood);border:1px solid var(--fret);border-radius:12px;
@@ -123,6 +126,7 @@ select{
     <div class="letter" id="noteLetter">&nbsp;</div>
     <div class="readout"><span><b id="cents">0</b> cents</span><span><b id="hz">—</b> Hz</span></div>
     <div class="hint wait" id="hint">Toca una cuerda al aire</div>
+    <div class="meter"><span id="meterLabel">Micrófono</span><div class="meter-bar"><div class="meter-fill" id="meterFill"></div></div></div>
   </section>
 
   <div class="strings" id="strings"></div>
@@ -225,22 +229,31 @@ select{
   setA4(a4); setMode(mode);
 
   // ---------- audio ----------
-  let ctx, analyser, buf, yinBuf, stream;
+  let ctx, analyser, buf, yinBuf, stream, src;
+  function ensureCtx(){
+    // En iPhone el AudioContext debe crearse y reanudarse dentro del mismo toque, sin esperas antes.
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state !== 'running') ctx.resume().catch(() => {});
+    return ctx;
+  }
   async function start(){
     const err = $('err'); err.hidden = true;
+    ensureCtx();
     if (!navigator.mediaDevices?.getUserMedia) { err.textContent = 'Este navegador no da acceso al micrófono. Abre la página por https (por ejemplo en GitHub Pages) con Chrome o Safari.'; err.hidden = false; return; }
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false } });
     } catch (e) {
       err.textContent = 'No hay permiso para el micrófono. Actívalo en los ajustes del navegador para esta página y vuelve a intentarlo.'; err.hidden = false; return;
     }
-    ctx = new (window.AudioContext || window.webkitAudioContext)();
-    if (ctx.state === 'suspended') await ctx.resume();
-    const src = ctx.createMediaStreamSource(stream);
+    if (ctx.state !== 'running') { try { await ctx.resume(); } catch {} }
+    src = ctx.createMediaStreamSource(stream); // referencia global: Safari puede soltarla si no
+    const boost = ctx.createGain(); boost.gain.value = 3;
     const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1400;
     const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 55;
     analyser = ctx.createAnalyser(); analyser.fftSize = 4096;
-    src.connect(hp); hp.connect(lp); lp.connect(analyser);
+    src.connect(boost); boost.connect(hp); hp.connect(lp); lp.connect(analyser);
+    // Safari a veces deja el contexto parado: cualquier toque en la pantalla lo reanuda.
+    document.addEventListener('touchend', () => { if (ctx.state !== 'running') ctx.resume(); }, { passive: true });
     buf = new Float32Array(analyser.fftSize);
     yinBuf = new Float32Array(Math.floor(ctx.sampleRate / 60) + 2);
     $('start').hidden = true;
@@ -257,7 +270,8 @@ select{
   function detect(b, sr){
     let rms = 0; for (let i = 0; i < b.length; i++) rms += b[i] * b[i];
     rms = Math.sqrt(rms / b.length);
-    if (rms < 0.006) return -1;
+    level = rms;
+    if (rms < 0.003) return -1;
     const maxTau = Math.min(yinBuf.length - 2, b.length >> 1), minTau = Math.floor(sr / 1100), W = b.length - maxTau;
     const d = yinBuf; d[0] = 1; let run = 0;
     for (let t = 1; t <= maxTau; t++) {
@@ -266,19 +280,27 @@ select{
     }
     let tau = -1;
     for (let t = minTau; t < maxTau; t++) {
-      if (d[t] < 0.12) { while (t + 1 < maxTau && d[t + 1] < d[t]) t++; tau = t; break; }
+      if (d[t] < 0.2) { while (t + 1 < maxTau && d[t + 1] < d[t]) t++; tau = t; break; }
     }
-    if (tau < 0) return -1;
+    if (tau < 0) { // sin cruce claro: usa el mínimo global si es razonable
+      let m = 1, mt = -1; for (let t = minTau; t < maxTau; t++) if (d[t] < m) { m = d[t]; mt = t; }
+      if (m < 0.35) tau = mt; else return -1;
+    }
     const x0 = d[tau - 1], x1 = d[tau], x2 = d[tau + 1], den = 2 * (2 * x1 - x2 - x0);
     const better = den ? tau + (x2 - x0) / den : tau;
     return sr / better;
   }
 
+  let level = 0, shownLevel = 0;
   const hist = []; let lastHeard = 0, needle = 0, inTuneSince = 0, buzzed = false;
   function loop(t){
     requestAnimationFrame(loop);
     analyser.getFloatTimeDomainData(buf);
+    level = 0;
     const f = detect(buf, ctx.sampleRate);
+    shownLevel += (Math.min(1, Math.sqrt(level) * 3) - shownLevel) * 0.3;
+    $('meterFill').style.transform = `scaleX(${shownLevel.toFixed(3)})`;
+    $('meterLabel').textContent = ctx.state !== 'running' ? 'Audio en pausa · toca la pantalla' : 'Micrófono';
     if (f > 60 && f < 1100) {
       if (hist.length && Math.abs(1200 * Math.log2(f / hist[hist.length - 1])) > 120) hist.length = 0; // salto de nota
       hist.push(f); if (hist.length > 7) hist.shift();
@@ -331,9 +353,8 @@ select{
   }
 
   // ---------- tono de referencia ----------
-  $('refBtn').onclick = async () => {
-    if (!ctx) { ctx = new (window.AudioContext || window.webkitAudioContext)(); }
-    if (ctx.state === 'suspended') await ctx.resume();
+  $('refBtn').onclick = () => {
+    ensureCtx();
     const notes = TUNINGS[tuningKey].notes;
     const i = locked >= 0 ? locked : targetIdx >= 0 ? targetIdx : 0;
     const f = midiToHz(notes[i]), now = ctx.currentTime;
